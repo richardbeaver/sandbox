@@ -1,0 +1,31 @@
+[package]
+name = "capsule-bench"
+version = "0.1.0"
+authors = ["Capsule Developers <capsule-dev@googlegroups.com>"]
+license = "Apache-2.0"
+edition = "2018"
+publish = false
+description = """
+Benchmarks for Capsule.
+"""
+
+[dev-dependencies]
+anyhow = "1.0"
+capsule = { version = "0.1", path = "../core", features = ["testils"] }
+criterion = "0.3"
+proptest = "1.0"
+
+[[bench]]
+name = "packets"
+path = "packets.rs"
+harness = false
+
+[[bench]]
+name = "combinators"
+path = "combinators.rs"
+harness = false
+
+[[bench]]
+name = "mbuf"
+path = "mbuf.rs"
+harness = false

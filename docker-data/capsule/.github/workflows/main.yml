@@ -1,0 +1,280 @@
+name: build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - uses: actions-rs/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  # issue on critcmp: https://github.com/BurntSushi/critcmp/issues/5
+  bench-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-18.04
+
+    container:
+      image: getcapsule/sandbox
+      options: --privileged
+
+    steps:
+      - name: install git
+        run: |
+          apt-get update && apt-get install -y git
+
+      - uses: actions/checkout@v2
+
+      - name: fetch git branches
+        run: |
+          git fetch --no-tags --prune --depth=1 origin +refs/heads/*:refs/remotes/origin/*
+
+      - name: install-critcmp
+        uses: actions-rs/cargo@v1
+        with:
+          command: install
+          args: --force critcmp
+
+      - name: run-bench-pr-changes
+        working-directory: ./bench
+        run: cargo bench -- --noplot --save-baseline changes
+
+      - name: export-bench-pr-changes
+        working-directory: ./bench
+        run: |
+          mkdir -p bench-runs
+          critcmp --export changes > bench-runs/changes.json
+        continue-on-error: true
+
+      - name: cache-cargo-build
+        uses: actions/cache@v1
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.toml') }}
+            ${{ runner.os }}-cargo-build-target-
+            ${{ runner.os }}-
+
+      - name: run-bench-master
+        working-directory: ./bench
+        run: |
+          git checkout master
+          cargo bench -- --noplot --save-baseline master
+
+      - name: export-bench-pr-master
+        working-directory: ./bench
+        run: critcmp --export master > bench-runs/master.json
+        continue-on-error: true
+
+      - name: compare-benches
+        working-directory: ./bench/bench-runs
+        run: critcmp master.json changes.json -t 5
+        continue-on-error: true
+
+      - name: upload-bench-exports
+        uses: actions/upload-artifact@v1
+        with:
+          name: criterion-cmp
+          path: ./bench/bench-runs
+        continue-on-error: true
+
+      - name: upload-bench-target
+        uses: actions/upload-artifact@v1
+        with:
+          name: criterion-report
+          path: ./target/criterion
+        continue-on-error: true
+
+  bench:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-18.04
+
+    container:
+      image: getcapsule/sandbox
+      options: --privileged
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: run-bench
+        run: make bench
+
+      - name: upload-bench-target-and-plots
+        uses: actions/upload-artifact@v1
+        with:
+          name: criterion-report
+          path: ./target/criterion
+
+  check:
+    runs-on: ubuntu-18.04
+    strategy:
+      matrix:
+        rust-toolchain: [stable, beta, nightly]
+        # Allow failures on nightly, it's just informative
+        include:
+          - rust-toolchain: stable
+            can-fail: false
+          - rust-toolchain: beta
+            can-fail: false
+          - rust-toolchain: nightly
+            can-fail: true
+
+    container:
+      image: getcapsule/sandbox
+      options: --privileged
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust-toolchain }}
+          override: true
+
+      - name: cargo-check
+        run: make check
+        continue-on-error: ${{ matrix.can-fail }}
+
+  coverage:
+    runs-on: ubuntu-18.04
+
+    container:
+      image: getcapsule/sandbox
+      options: --privileged
+
+    steps:
+      - name: install curl
+        run: apt-get update && apt-get install -y curl
+
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
+
+      - name: install-tarpaulin
+        uses: actions-rs/cargo@v1
+        with:
+          command: install
+          args: --force cargo-tarpaulin
+
+      - name: run-tarpaulin
+        uses: actions-rs/cargo@v1
+        with:
+          command: tarpaulin
+          args: "-p capsule -l --count --exclude-files examples/* ffi/* macros/* --out Xml -Zpackage-features --features full"
+
+      - uses: codecov/codecov-action@v1
+        with:
+          file: ./cobertura.xml
+
+  format:
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: cargo-fmt
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+  lint:
+    runs-on: ubuntu-18.04
+
+    container:
+      image: getcapsule/sandbox
+      options: --privileged
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: cargo-clippy
+        run: make lint
+
+  sanitize:
+    runs-on: ubuntu-18.04
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: set-hugepages
+        run: |
+          sudo sysctl -w vm.nr_hugepages=1024
+          cat /proc/meminfo | grep Huge
+
+      - name: cargo-run-pktdump-with-address-sanitizer
+        run: |
+          docker run --rm --privileged --network=host \
+            -w /home/capsule/examples/pktdump \
+            -v /dev/hugepages:/dev/hugepages \
+            -v `pwd`:/home/capsule \
+            --env RUSTFLAGS="-Z sanitizer=address" \
+            --env ASAN_OPTIONS=detect_leaks=1 \
+            --env LSAN_OPTIONS=suppressions=suppressions.txt \
+            getcapsule/sandbox \
+            /bin/bash -c "rustup install nightly && rustup default nightly \
+            && rustup component add rust-src \
+            && cargo run --target x86_64-unknown-linux-gnu -Zbuild-std -- -f pktdump.toml"
+
+  test:
+    runs-on: ubuntu-18.04
+
+    container:
+      image: getcapsule/sandbox
+      options: --privileged
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: cargo-test
+        run: make test
+
+  discord-pr:
+    if: github.event_name == 'pull_request'
+    needs: [audit, bench-pr, check, coverage, format, lint, sanitize, test]
+    runs-on: ubuntu-18.04
+    steps:
+      - name: discord-it
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: info
+          description: "*${{ github.workflow }} PR Succeeded!* ~ ${{ github.HEAD_REF }} by ${{ github.ACTOR }} ~ https://github.com/capsule-rs/capsule/actions"
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+        continue-on-error: true
+
+  discord:
+    if: github.event_name == 'push'
+    needs: [audit, bench, check, coverage, format, lint, sanitize, test]
+    runs-on: ubuntu-18.04
+    steps:
+      - name: discord-it
+        uses: rjstone/discord-webhook-notify@v1
+        with:
+          severity: info
+          description: "*${{ github.workflow }} Succeeded!* ~ ${{ github.HEAD_REF }} by ${{ github.ACTOR }} ~ https://github.com/capsule-rs/capsule/actions"
+          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+        continue-on-error: true
